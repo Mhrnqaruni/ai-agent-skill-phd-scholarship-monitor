@@ -28,10 +28,12 @@ except ImportError:  # pragma: no cover - Python 3.9+ is required.
     ZoneInfoNotFoundError = Exception  # type: ignore[assignment]
 
 
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 1
 PROFILE_SCHEMA_VERSION = 1
-TRACKER_VERSION = "1.1.0"
+TRACKER_VERSION = "1.2.0"
+
+CV_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".md", ".rtf"}
 
 SCORE_COMPONENTS = {
     "topic_alignment": 35,
@@ -194,6 +196,38 @@ def display_text(value: Any) -> str:
 def hash_json(value: Any) -> str:
     canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cv_inventory(input_path: Path) -> tuple[list[Path], str | None]:
+    if not input_path.exists():
+        return [], None
+    files = sorted(
+        (
+            item
+            for item in input_path.rglob("*")
+            if item.is_file() and item.suffix.casefold() in CV_EXTENSIONS
+        ),
+        key=lambda item: item.relative_to(input_path).as_posix().casefold(),
+    )
+    if not files:
+        return [], None
+    inventory = [
+        {
+            "path": item.relative_to(input_path).as_posix(),
+            "size": item.stat().st_size,
+            "sha256": hash_file(item),
+        }
+        for item in files
+    ]
+    return files, hash_json(inventory)
 
 
 def normalize_url(raw_url: str) -> str:
@@ -551,27 +585,21 @@ def validate_config(config: Any) -> tuple[dict[str, Any], list[str]]:
             f"source_registry.{country}.local_terms must be a list of nonblank strings",
         )
         for index, source in enumerate(required_sources):
-            if isinstance(source, str):
-                require(
-                    bool(display_text(source)),
-                    f"source_registry.{country}.required_core_sources[{index}] cannot be blank",
-                )
-            elif isinstance(source, dict):
+            if isinstance(source, dict):
                 name = source.get("name")
                 url = source.get("url")
                 require(
-                    (isinstance(name, str) and bool(display_text(name))) or bool(url),
-                    f"source_registry.{country}.required_core_sources[{index}] needs a name or URL",
+                    isinstance(name, str) and bool(display_text(name)),
+                    f"source_registry.{country}.required_core_sources[{index}].name is required",
                 )
-                if url:
-                    validate_url(
-                        url,
-                        f"source_registry.{country}.required_core_sources[{index}].url",
-                        required=True,
-                    )
+                validate_url(
+                    url,
+                    f"source_registry.{country}.required_core_sources[{index}].url",
+                    required=True,
+                )
             else:
                 raise ContractError(
-                    f"source_registry.{country}.required_core_sources[{index}] must be a string or object"
+                    f"source_registry.{country}.required_core_sources[{index}] must be an object with name and canonical URL"
                 )
         if not required_sources:
             warnings.append(
@@ -591,7 +619,11 @@ def validate_profile(profile: Any, *, require_confirmed: bool) -> tuple[dict[str
     warnings = []
     if require_confirmed:
         require(profile.get("confirmed_by_user") is True, "profile has not been confirmed by the user")
-        parse_timestamp(profile.get("confirmed_at"), "profile.confirmed_at")
+        confirmed_at = parse_timestamp(profile.get("confirmed_at"), "profile.confirmed_at")
+        require(
+            confirmed_at.astimezone(timezone.utc) <= utc_now() + timedelta(minutes=10),
+            "profile.confirmed_at is in the future",
+        )
         require(bool(profile.get("education")), "confirmed profile must include at least one education record")
         require(bool(profile.get("research_interests")), "confirmed profile must include at least one research interest")
         nationalities = profile["eligibility"].get("nationalities")
@@ -619,8 +651,6 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version > DB_SCHEMA_VERSION:
         raise ContractError(f"Database schema {version} is newer than tracker schema {DB_SCHEMA_VERSION}")
-    if version == DB_SCHEMA_VERSION:
-        return
     if version == 1:
         columns = {
             str(row["name"])
@@ -635,7 +665,25 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                 connection.execute(
                     "ALTER TABLE opportunities ADD COLUMN stipend_period TEXT NOT NULL DEFAULT 'UNKNOWN'"
                 )
-            connection.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
+            connection.execute("PRAGMA user_version = 2")
+        version = 2
+    if version == 2:
+        run_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        with connection:
+            if "cv_hash" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN cv_hash TEXT NOT NULL DEFAULT ''"
+                )
+            if "cv_changed" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN cv_changed INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute("PRAGMA user_version = 3")
+        version = 3
+    if version == DB_SCHEMA_VERSION:
         return
     if version != 0:
         raise ContractError(f"No migration path from database schema {version}")
@@ -654,11 +702,13 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                 status TEXT NOT NULL,
                 config_hash TEXT NOT NULL,
                 profile_hash TEXT NOT NULL,
+                cv_hash TEXT NOT NULL,
                 scoring_version TEXT NOT NULL,
                 countries_json TEXT NOT NULL,
                 countries_added_json TEXT NOT NULL,
                 countries_removed_json TEXT NOT NULL,
                 profile_changed INTEGER NOT NULL,
+                cv_changed INTEGER NOT NULL,
                 scoring_changed INTEGER NOT NULL,
                 coverage_json TEXT,
                 notes TEXT,
@@ -767,7 +817,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                 created_at TEXT NOT NULL
             );
 
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             """
         )
 
@@ -802,14 +852,8 @@ def validate_workspace(paths: dict[str, Path], *, allow_unconfirmed: bool) -> di
     except ContractError as exc:
         errors.append(str(exc))
 
-    cv_extensions = {".pdf", ".doc", ".docx", ".txt", ".md", ".rtf"}
-    cv_files = []
-    if paths["input"].exists():
-        cv_files = [
-            str(item.resolve())
-            for item in paths["input"].iterdir()
-            if item.is_file() and item.suffix.casefold() in cv_extensions
-        ]
+    cv_paths, cv_hash = cv_inventory(paths["input"])
+    cv_files = [str(item.resolve()) for item in cv_paths]
     if not cv_files:
         errors.append(f"No CV file found in {paths['input']}")
 
@@ -832,6 +876,7 @@ def validate_workspace(paths: dict[str, Path], *, allow_unconfirmed: bool) -> di
         "warnings": warnings,
         "workspace": str(paths["root"]),
         "cv_files": cv_files,
+        "cv_hash": cv_hash,
         "config": config,
         "profile": profile,
         "config_hash": hash_json(config) if config is not None else None,
@@ -963,14 +1008,22 @@ def country_map(countries: Iterable[str]) -> dict[str, str]:
     return {normalized_text(country): display_text(country) for country in countries}
 
 
-def load_runtime(paths: dict[str, Path]) -> tuple[dict[str, Any], dict[str, Any], str, str]:
+def load_runtime(
+    paths: dict[str, Path],
+) -> tuple[dict[str, Any], dict[str, Any], str, str, str]:
     validation = validate_workspace(paths, allow_unconfirmed=False)
     if not validation["ok"]:
         raise ContractError("; ".join(validation["errors"]))
     config = validation["config"]
     profile = validation["profile"]
     assert isinstance(config, dict) and isinstance(profile, dict)
-    return config, profile, str(validation["config_hash"]), str(validation["profile_hash"])
+    return (
+        config,
+        profile,
+        str(validation["config_hash"]),
+        str(validation["profile_hash"]),
+        str(validation["cv_hash"]),
+    )
 
 
 def acquire_run_lock(paths: dict[str, Path], run_id: str, max_run_hours: int) -> dict[str, Any] | None:
@@ -1090,6 +1143,7 @@ def assert_run_snapshot(
     run: sqlite3.Row,
     config_hash: str,
     profile_hash: str,
+    cv_hash: str,
     config: dict[str, Any],
 ) -> None:
     mismatches = []
@@ -1097,6 +1151,8 @@ def assert_run_snapshot(
         mismatches.append("config.json changed")
     if run["profile_hash"] != profile_hash:
         mismatches.append("profile.json changed")
+    if run["cv_hash"] != cv_hash:
+        mismatches.append("CV input changed")
     if run["scoring_version"] != config["scoring_version"]:
         mismatches.append("scoring_version changed")
     require(
@@ -1138,7 +1194,7 @@ def mark_scope(connection: sqlite3.Connection, configured_countries: list[str]) 
 
 
 def command_run_start(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, config_hash, profile_hash = load_runtime(paths)
+    config, profile, config_hash, profile_hash, cv_hash = load_runtime(paths)
     recovered_lock = recover_finished_run_lock(paths)
     run_id = f"run-{utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     stale = acquire_run_lock(paths, run_id, int(config["search"]["max_run_hours"]))
@@ -1164,30 +1220,62 @@ def command_run_start(args: argparse.Namespace, paths: dict[str, Path]) -> dict[
             removed = []
 
         previous_profile_hash = get_metadata(connection, "last_completed_profile_hash")
+        previous_cv_hash = get_metadata(connection, "last_completed_cv_hash")
         previous_scoring_version = get_metadata(connection, "last_completed_scoring_version")
         profile_changed = previous_profile_hash is not None and previous_profile_hash != profile_hash
+        cv_changed = previous_cv_hash is not None and previous_cv_hash != cv_hash
         scoring_changed = previous_scoring_version is not None and previous_scoring_version != config["scoring_version"]
+        require(
+            not cv_changed or profile_changed,
+            "CV input changed since the last complete run but profile.json was not updated and reconfirmed; rebuild or reconfirm the profile before monitoring",
+        )
+        if cv_changed:
+            previous_run_id = get_metadata(connection, "last_completed_run_id")
+            previous_run = (
+                connection.execute(
+                    "SELECT finished_at FROM runs WHERE run_id = ?", (previous_run_id,)
+                ).fetchone()
+                if previous_run_id
+                else None
+            )
+            require(
+                previous_run is not None and previous_run["finished_at"],
+                "Cannot verify CV/profile reconfirmation chronology against the prior complete run",
+            )
+            confirmed_at = parse_timestamp(
+                profile.get("confirmed_at"), "profile.confirmed_at"
+            )
+            prior_finished_at = parse_timestamp(
+                previous_run["finished_at"], "previous run finished_at"
+            )
+            require(
+                confirmed_at.astimezone(timezone.utc)
+                > prior_finished_at.astimezone(timezone.utc),
+                "CV input changed, but profile.confirmed_at is not later than the prior complete run; re-extract and explicitly reconfirm the profile",
+            )
 
         mark_scope(connection, config["countries"])
         with connection:
             connection.execute(
                 """
                 INSERT INTO runs(
-                    run_id, started_at, status, config_hash, profile_hash, scoring_version,
+                    run_id, started_at, status, config_hash, profile_hash, cv_hash, scoring_version,
                     countries_json, countries_added_json, countries_removed_json,
-                    profile_changed, scoring_changed
-                ) VALUES(?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?)
+                    profile_changed, cv_changed, scoring_changed
+                ) VALUES(?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
                     iso_utc(),
                     config_hash,
                     profile_hash,
+                    cv_hash,
                     config["scoring_version"],
                     json.dumps(config["countries"], ensure_ascii=False),
                     json.dumps(added, ensure_ascii=False),
                     json.dumps(removed, ensure_ascii=False),
                     int(profile_changed),
+                    int(cv_changed),
                     int(scoring_changed),
                 ),
             )
@@ -1198,9 +1286,11 @@ def command_run_start(args: argparse.Namespace, paths: dict[str, Path]) -> dict[
             "countries_added": added,
             "countries_removed": removed,
             "profile_changed": profile_changed,
+            "cv_changed": cv_changed,
             "scoring_changed": scoring_changed,
             "config_hash": config_hash,
             "profile_version": profile_hash[:12],
+            "cv_version": cv_hash[:12],
             "backup": str(backup),
             "recovered_finished_lock": recovered_lock,
         }
@@ -1257,12 +1347,12 @@ def record_due_reason(
 
 
 def command_due(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, config_hash, profile_hash = load_runtime(paths)
+    config, _profile, config_hash, profile_hash, cv_hash = load_runtime(paths)
     connection = connect_database(paths["database"])
     try:
         run = require_running_run(connection, args.run_id)
         require_run_lock(paths, args.run_id)
-        assert_run_snapshot(run, config_hash, profile_hash, config)
+        assert_run_snapshot(run, config_hash, profile_hash, cv_hash, config)
         added = {normalized_text(value) for value in json.loads(run["countries_added_json"])}
         due = []
         for row in connection.execute("SELECT * FROM opportunities ORDER BY last_verified_at ASC").fetchall():
@@ -1287,6 +1377,7 @@ def command_due(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, A
                         "current_decision": row["current_decision"],
                         "lifecycle_status": row["lifecycle_status"],
                         "last_verified_at": row["last_verified_at"],
+                        "content_hash": row["content_hash"],
                         "reason": reason,
                     }
                 )
@@ -1363,8 +1454,54 @@ def find_identity_signals(
     return sorted(strong_matches), sorted(fingerprint_matches)
 
 
+def validate_existing_record_update(
+    connection: sqlite3.Connection,
+    existing: sqlite3.Row,
+    packet: dict[str, Any],
+    fingerprint: str,
+    identity_urls: list[str],
+    *,
+    explicit_record_id: bool,
+) -> None:
+    if explicit_record_id:
+        require(
+            packet["expected_prior_content_hash"] == existing["content_hash"],
+            "expected_prior_content_hash does not match the current canonical record; run lookup/due again before updating",
+        )
+    require(
+        normalized_text(packet["university"]) == normalized_text(existing["university"]),
+        "candidate update cannot change the canonical university identity",
+    )
+    require(
+        normalized_text(packet["country"]) == normalized_text(existing["country"]),
+        "candidate update cannot change the canonical country identity",
+    )
+
+    existing_official_id = display_text(existing["official_id"])
+    packet_official_id = display_text(packet["official_id"])
+    if existing_official_id:
+        require(
+            normalized_text(packet_official_id) == normalized_text(existing_official_id),
+            "candidate update cannot remove or replace the canonical official_id",
+        )
+        return
+
+    known_urls = {str(existing["canonical_url"])}
+    known_urls.update(
+        str(row["alias_url"])
+        for row in connection.execute(
+            "SELECT alias_url FROM aliases WHERE record_id = ?", (existing["record_id"],)
+        ).fetchall()
+    )
+    require(
+        bool(known_urls.intersection(identity_urls))
+        or fingerprint == existing["fingerprint"],
+        "candidate update lacks a matching canonical URL, alias, official identity, or fingerprint",
+    )
+
+
 def command_lookup(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, _config_hash, profile_hash = load_runtime(paths)
+    config, _profile, _config_hash, profile_hash, _cv_hash = load_runtime(paths)
     connection = connect_database(paths["database"])
     try:
         urls = [normalize_url(args.url)] if args.url else []
@@ -1456,13 +1593,13 @@ def upsert_alias(
 
 
 def command_touch(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, config_hash, profile_hash = load_runtime(paths)
+    config, _profile, config_hash, profile_hash, cv_hash = load_runtime(paths)
     connection = connect_database(paths["database"])
     observed = iso_utc()
     try:
         run = require_running_run(connection, args.run_id)
         require_run_lock(paths, args.run_id)
-        assert_run_snapshot(run, config_hash, profile_hash, config)
+        assert_run_snapshot(run, config_hash, profile_hash, cv_hash, config)
         row = connection.execute("SELECT record_id FROM opportunities WHERE record_id = ?", (args.record_id,)).fetchone()
         require(row is not None, f"Unknown record_id: {args.record_id}")
         url = normalize_url(args.url) if args.url else None
@@ -1551,7 +1688,32 @@ def validate_evidence(evidence: Any, config: dict[str, Any]) -> list[dict[str, A
     return cleaned
 
 
-def validate_review(review: Any, config: dict[str, Any]) -> dict[str, Any] | None:
+def candidate_review_subject_hash(
+    packet: dict[str, Any], review_context: dict[str, str]
+) -> str:
+    material = copy.deepcopy(packet)
+    material.pop("review", None)
+    material.pop("content_hash", None)
+    if isinstance(material.get("discovery_urls"), list):
+        material["discovery_urls"] = sorted(material["discovery_urls"])
+    if isinstance(material.get("evidence"), list):
+        material["evidence"] = sorted(
+            material["evidence"],
+            key=lambda item: (
+                item.get("fact", ""),
+                item.get("url", ""),
+                item.get("authority", ""),
+                item.get("checked_at", ""),
+            ),
+        )
+    return hash_json({"candidate": material, "runtime": review_context})
+
+
+def validate_review(
+    review: Any,
+    config: dict[str, Any],
+    expected_subject_hash: str,
+) -> dict[str, Any] | None:
     if review is None:
         return None
     require(isinstance(review, dict), "review must be an object or null")
@@ -1559,6 +1721,21 @@ def validate_review(review: Any, config: dict[str, Any]) -> dict[str, Any] | Non
     verdict = review.get("verdict")
     require(mode in REVIEW_MODES, f"review.mode must be one of {sorted(REVIEW_MODES)}")
     require(verdict in REVIEW_VERDICTS, f"review.verdict must be one of {sorted(REVIEW_VERDICTS)}")
+    reviewer_id = review.get("reviewer_id")
+    require(
+        isinstance(reviewer_id, str) and display_text(reviewer_id),
+        "review.reviewer_id is required",
+    )
+    subject_hash = review.get("subject_hash")
+    require(
+        isinstance(subject_hash, str)
+        and re.fullmatch(r"[0-9a-f]{64}", subject_hash) is not None,
+        "review.subject_hash must be a lowercase SHA-256 digest",
+    )
+    require(
+        subject_hash == expected_subject_hash,
+        "critical review is not bound to this normalized candidate, evidence, and runtime snapshot; regenerate the review subject hash and review again",
+    )
     reviewed_at = parse_timestamp(review.get("reviewed_at"), "review.reviewed_at")
     current = utc_now()
     require(reviewed_at.astimezone(timezone.utc) <= current + timedelta(minutes=10), "review.reviewed_at is in the future")
@@ -1569,15 +1746,36 @@ def validate_review(review: Any, config: dict[str, Any]) -> dict[str, Any] | Non
     return {
         "mode": mode,
         "verdict": verdict,
+        "reviewer_id": display_text(reviewer_id),
+        "subject_hash": subject_hash,
         "reviewed_at": reviewed_at.isoformat(),
         "notes": display_text(notes),
     }
 
 
-def validate_candidate_packet(packet: Any, config: dict[str, Any]) -> tuple[dict[str, Any], float | None]:
+def validate_candidate_packet(
+    packet: Any,
+    config: dict[str, Any],
+    review_context: dict[str, str],
+) -> tuple[dict[str, Any], float | None, str]:
     require(isinstance(packet, dict), "candidate packet must contain an object")
     cleaned: dict[str, Any] = {}
     cleaned["record_id"] = optional_text(packet, "record_id")
+    cleaned["expected_prior_content_hash"] = optional_text(
+        packet, "expected_prior_content_hash"
+    )
+    if cleaned["record_id"]:
+        require(
+            cleaned["expected_prior_content_hash"] is not None
+            and re.fullmatch(r"[0-9a-f]{64}", cleaned["expected_prior_content_hash"])
+            is not None,
+            "expected_prior_content_hash must be the current lowercase SHA-256 content hash when record_id is supplied",
+        )
+    else:
+        require(
+            cleaned["expected_prior_content_hash"] is None,
+            "expected_prior_content_hash is only valid with record_id",
+        )
     cleaned["official_id"] = optional_text(packet, "official_id")
     for key in ("title", "university", "country"):
         cleaned[key] = required_text(packet, key)
@@ -1651,7 +1849,7 @@ def validate_candidate_packet(packet: Any, config: dict[str, Any]) -> tuple[dict
     require(cleaned["official_posting_url"] or cleaned_discovery, "candidate requires an official or discovery URL")
 
     cleaned["evidence"] = validate_evidence(packet.get("evidence"), config)
-    cleaned["review"] = validate_review(packet.get("review"), config)
+    review_raw = packet.get("review")
     cleaned["rejection_reason"] = optional_text(packet, "rejection_reason")
 
     supplied_hash = optional_text(packet, "content_hash")
@@ -1689,16 +1887,20 @@ def validate_candidate_packet(packet: Any, config: dict[str, Any]) -> tuple[dict
         }
     else:
         cleaned["duplicate_review"] = None
-    return cleaned, total
+    subject_hash = candidate_review_subject_hash(cleaned, review_context)
+    cleaned["review"] = validate_review(review_raw, config, subject_hash)
+    return cleaned, total, subject_hash
 
 
 def material_packet_hash(packet: dict[str, Any]) -> str:
     material = copy.deepcopy(packet)
     material.pop("record_id", None)
+    material.pop("expected_prior_content_hash", None)
     material.pop("content_hash", None)
     review = material.get("review")
     if isinstance(review, dict):
         review.pop("reviewed_at", None)
+        review.pop("subject_hash", None)
     for item in material.get("evidence", []):
         if isinstance(item, dict):
             item.pop("checked_at", None)
@@ -1709,6 +1911,29 @@ def material_packet_hash(packet: dict[str, Any]) -> str:
             material["evidence"], key=lambda item: (item.get("fact", ""), item.get("url", ""))
         )
     return hash_json(material)
+
+
+def command_review_subject(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
+    config, _profile, config_hash, profile_hash, cv_hash = load_runtime(paths)
+    packet_raw = read_json(Path(args.file).expanduser().resolve())
+    require(isinstance(packet_raw, dict), "candidate packet must contain an object")
+    packet_without_review = copy.deepcopy(packet_raw)
+    packet_without_review["review"] = None
+    review_context = {
+        "config_hash": config_hash,
+        "profile_hash": profile_hash,
+        "cv_hash": cv_hash,
+    }
+    _packet, _score_total, subject_hash = validate_candidate_packet(
+        packet_without_review, config, review_context
+    )
+    return {
+        "ok": True,
+        "subject_hash": subject_hash,
+        "profile_version": profile_hash[:12],
+        "cv_version": cv_hash[:12],
+        "instruction": "Review this exact normalized candidate/evidence snapshot, then copy subject_hash into review.subject_hash.",
+    }
 
 
 def authoritative_fact_present(evidence: list[dict[str, Any]], fact: str) -> bool:
@@ -1877,9 +2102,23 @@ def derive_decision(
 
 
 def command_candidate_upsert(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, config_hash, profile_hash = load_runtime(paths)
+    config, _profile, config_hash, profile_hash, cv_hash = load_runtime(paths)
+    preflight = connect_database(paths["database"])
+    try:
+        run = require_running_run(preflight, args.run_id)
+        require_run_lock(paths, args.run_id)
+        assert_run_snapshot(run, config_hash, profile_hash, cv_hash, config)
+    finally:
+        preflight.close()
     packet_raw = read_json(Path(args.file).expanduser().resolve())
-    packet, score_total = validate_candidate_packet(packet_raw, config)
+    review_context = {
+        "config_hash": config_hash,
+        "profile_hash": profile_hash,
+        "cv_hash": cv_hash,
+    }
+    packet, score_total, _subject_hash = validate_candidate_packet(
+        packet_raw, config, review_context
+    )
     decision, lifecycle, reasons = derive_decision(packet, score_total, config)
     content_hash = material_packet_hash(packet)
     now_value = iso_utc()
@@ -1891,9 +2130,22 @@ def command_candidate_upsert(args: argparse.Namespace, paths: dict[str, Path]) -
 
     connection = connect_database(paths["database"])
     try:
+        (
+            current_config,
+            _current_profile,
+            current_config_hash,
+            current_profile_hash,
+            current_cv_hash,
+        ) = load_runtime(paths)
         run = require_running_run(connection, args.run_id)
         require_run_lock(paths, args.run_id)
-        assert_run_snapshot(run, config_hash, profile_hash, config)
+        assert_run_snapshot(
+            run,
+            current_config_hash,
+            current_profile_hash,
+            current_cv_hash,
+            current_config,
+        )
         matches, fingerprint_matches = find_identity_signals(
             connection,
             record_id=packet["record_id"],
@@ -1916,6 +2168,15 @@ def command_candidate_upsert(args: argparse.Namespace, paths: dict[str, Path]) -
             if matches
             else None
         )
+        if existing is not None:
+            validate_existing_record_update(
+                connection,
+                existing,
+                packet,
+                fingerprint,
+                identity_urls,
+                explicit_record_id=bool(packet["record_id"]),
+            )
         record_id = str(existing["record_id"]) if existing else f"phd-{uuid.uuid4().hex[:20]}"
         was_published = bool(existing["ever_published"]) if existing else False
         ever_published = was_published or decision == "PUBLISH"
@@ -2171,21 +2432,13 @@ def normalize_coverage(raw: Any, config: dict[str, Any]) -> tuple[dict[str, Any]
                 display_text(notes)
                 + " No required core sources are configured; COMPLETE coverage is not permitted."
             ).strip()
-        observed_names = {normalized_text(source["name"]) for source in cleaned_sources if source["status"] == "OK"}
         observed_urls = {source["url"] for source in cleaned_sources if source["status"] == "OK"}
         missing_required = []
         for required_source in required_sources:
-            if isinstance(required_source, str):
-                matched = normalized_text(required_source) in observed_names
-                label = required_source
-            elif isinstance(required_source, dict):
+            if isinstance(required_source, dict):
                 label = display_text(required_source.get("name") or required_source.get("url"))
                 required_url = required_source.get("url")
-                matched = False
-                if required_url:
-                    matched = normalize_url(required_url) in observed_urls
-                if required_source.get("name"):
-                    matched = matched or normalized_text(required_source["name"]) in observed_names
+                matched = normalize_url(required_url) in observed_urls
             else:
                 raise ContractError(f"Invalid required core source for {country}")
             if not matched:
@@ -2435,7 +2688,7 @@ def require_existing_run(connection: sqlite3.Connection, run_id: str) -> sqlite3
 
 
 def command_run_finish(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, config_hash, profile_hash = load_runtime(paths)
+    config, _profile, config_hash, profile_hash, cv_hash = load_runtime(paths)
     coverage_raw = read_json(Path(args.coverage).expanduser().resolve())
     coverage, overall = normalize_coverage(coverage_raw, config)
     connection = connect_database(paths["database"])
@@ -2443,7 +2696,7 @@ def command_run_finish(args: argparse.Namespace, paths: dict[str, Path]) -> dict
     try:
         run = require_running_run(connection, args.run_id)
         require_run_lock(paths, args.run_id)
-        assert_run_snapshot(run, config_hash, profile_hash, config)
+        assert_run_snapshot(run, config_hash, profile_hash, cv_hash, config)
         with connection:
             refresh_lifecycles(connection, config, args.run_id)
 
@@ -2506,6 +2759,7 @@ def command_run_finish(args: argparse.Namespace, paths: dict[str, Path]) -> dict
             if overall == "COMPLETE":
                 set_metadata(connection, "last_completed_countries", json.dumps(config["countries"], ensure_ascii=False))
                 set_metadata(connection, "last_completed_profile_hash", profile_hash)
+                set_metadata(connection, "last_completed_cv_hash", cv_hash)
                 set_metadata(connection, "last_completed_scoring_version", config["scoring_version"])
                 set_metadata(connection, "last_completed_config_hash", config_hash)
                 set_metadata(connection, "last_completed_run_id", args.run_id)
@@ -2543,7 +2797,7 @@ def command_run_abort(args: argparse.Namespace, paths: dict[str, Path]) -> dict[
 
 
 def command_export(_args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, _config_hash, _profile_hash = load_runtime(paths)
+    config, _profile, _config_hash, _profile_hash, _cv_hash = load_runtime(paths)
     connection = connect_database(paths["database"])
     try:
         path = export_csv(connection, paths, config)
@@ -2554,7 +2808,7 @@ def command_export(_args: argparse.Namespace, paths: dict[str, Path]) -> dict[st
 
 
 def command_stats(_args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]:
-    config, _profile, config_hash, profile_hash = load_runtime(paths)
+    config, _profile, config_hash, profile_hash, cv_hash = load_runtime(paths)
     connection = connect_database(paths["database"])
     try:
         decisions = {
@@ -2575,6 +2829,7 @@ def command_stats(_args: argparse.Namespace, paths: dict[str, Path]) -> dict[str
             "countries": config["countries"],
             "config_hash": config_hash,
             "profile_version": profile_hash[:12],
+            "cv_version": cv_hash[:12],
             "opportunities_total": int(connection.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]),
             "published_history_rows": int(connection.execute("SELECT COUNT(*) FROM opportunities WHERE ever_published = 1").fetchone()[0]),
             "decisions": decisions,
@@ -2630,6 +2885,13 @@ def build_parser() -> argparse.ArgumentParser:
     upsert_parser.add_argument("--run-id", required=True)
     upsert_parser.add_argument("--file", required=True)
     upsert_parser.set_defaults(handler=command_candidate_upsert)
+
+    subject_parser = subparsers.add_parser(
+        "review-subject",
+        help="Compute the binding hash a critical reviewer must review",
+    )
+    subject_parser.add_argument("--file", required=True)
+    subject_parser.set_defaults(handler=command_review_subject)
 
     finish_parser = subparsers.add_parser("run-finish", help="Finalize coverage and generate outputs")
     finish_parser.add_argument("--run-id", required=True)

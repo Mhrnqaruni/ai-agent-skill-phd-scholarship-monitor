@@ -54,26 +54,26 @@ Do not schedule an untested setup.
 
 ## Daily run workflow
 
-1. Run `validate`, then `run-start`. Retain its JSON result, including `run_id`, profile-change status, and added or removed countries.
+1. Run `validate`, then `run-start`. Retain its JSON result, including `run_id`, CV/profile-change status, and added or removed countries.
 2. Run `due` for records requiring re-verification. A changed profile or scoring version requires reassessment of all affected active records.
 3. Search every configured country and record coverage even when no candidate qualifies.
 4. When subagents are available, delegate country discovery in parallel using only the minimum redacted profile facts required. Give each researcher a country/source scope and require direct URLs plus evidence notes. Keep deduplication, judgment, and all writes in the lead agent.
 5. Before fully evaluating a discovered URL, call `lookup`. If the record is unchanged and not due, call `touch`; do not rescore it.
 6. For a new, changed, or due candidate, verify the official posting, application path, funding, deadline, and every applicable eligibility rule. Resolve separate programme and funding deadlines.
-7. Apply the scoring rubric only after hard gates pass. Create the candidate packet defined in `data-contracts.md`.
-8. Obtain an independent critical pass for every potentially publishable candidate. Prefer a separate verifier subagent when available; otherwise perform a clearly separated self-second-pass. Store the review mode and verdict.
-9. Call `candidate-upsert`. Accept the tracker's derived decision; do not override a `HOLD`, `REJECT`, or `UNDER_THRESHOLD` result.
+7. Apply the scoring rubric only after hard gates pass. Create the candidate packet defined in `data-contracts.md` with `review=null`.
+8. Run `review-subject` on that packet. Give the exact packet, returned subject hash, direct evidence, and minimum confirmed profile facts to an independent verifier subagent when available; otherwise perform a clearly separated self-second-pass. Record reviewer ID, mode, verdict, subject hash, timestamp, and notes. If any packet or evidence field changes, recompute the subject hash and review again.
+9. Call `candidate-upsert`. For an explicit existing `record_id`, also supply the current `content_hash` returned by `lookup` or `due` as `expected_prior_content_hash`. Accept the tracker's derived decision; do not override a `HOLD`, `REJECT`, or `UNDER_THRESHOLD` result.
 10. Call `run-finish` with per-country and per-source coverage. It refreshes lifecycle states and creates the cumulative CSV, daily Markdown report, and run log atomically where possible.
 11. Return the daily report to the user. Distinguish “no verified matches” from partial or failed coverage.
 
 If work stops after `run-start`, call `run-abort` with the reason so the next run can recover cleanly.
 
-Do not edit `config.json` or `profile.json` during a live run. The tracker rejects snapshot drift; abort and restart so every decision binds to one profile and configuration.
+Do not edit `config.json`, `profile.json`, or any CV file during a live run. The tracker rejects snapshot drift; abort and restart so every decision binds to one CV, profile, and configuration.
 
 ## Update workflow
 
 - **Countries**: Edit `config.json`, validate it, and perform a baseline sweep for added countries. Keep removed-country history and mark it out of scope.
-- **CV/profile**: Re-extract changed facts, obtain user confirmation, and rerun all active/held candidates. Never silently carry old scores across a changed profile.
+- **CV/profile**: Replace the CV only outside a live run, re-extract changed facts, obtain fresh user confirmation with a new `confirmed_at`, and rerun all active/held candidates. The tracker refuses a changed CV paired with an unreconfirmed profile. Never silently carry old scores across a changed profile.
 - **Funding policy or scoring rubric**: Increment `scoring_version` and reassess affected records.
 - **Schedule/timezone**: Update both `config.json` and the Codex scheduled task. Report any mismatch.
 - **Threshold**: Never configure a reporting threshold below 80.

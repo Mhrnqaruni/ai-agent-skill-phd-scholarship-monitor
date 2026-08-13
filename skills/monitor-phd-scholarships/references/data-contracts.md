@@ -102,7 +102,14 @@ python <SCRIPT> --workspace <WORKSPACE> touch \
   --run-id <RUN_ID> --record-id <RECORD_ID> --url <OBSERVED_URL>
 ```
 
-After full evaluation, write a candidate packet to a temporary JSON file and run:
+After full evaluation, write a candidate packet with `review=null` to a temporary JSON file. Compute the exact review binding:
+
+```text
+python <SCRIPT> --workspace <WORKSPACE> review-subject \
+  --file <CANDIDATE_JSON>
+```
+
+Give the exact file and returned `subject_hash` to the critic. Add the critic's bound review without changing any other field; any change requires a new hash and a new review. Then run:
 
 ```text
 python <SCRIPT> --workspace <WORKSPACE> candidate-upsert \
@@ -130,6 +137,7 @@ Use this complete shape for a potentially publishable candidate. Use JSON `null`
 ```json
 {
   "record_id": null,
+  "expected_prior_content_hash": null,
   "official_id": "REQ-1234",
   "title": "Doctoral Researcher in Example Topic",
   "research_topic": "Concise normalized topic",
@@ -235,6 +243,8 @@ Use this complete shape for a potentially publishable candidate. Use JSON `null`
   "review": {
     "mode": "INDEPENDENT_AGENT",
     "verdict": "PASS",
+    "reviewer_id": "verifier-agent-task-or-stable-id",
+    "subject_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "reviewed_at": "2026-08-13T12:20:00+08:00",
     "notes": "Independent hard-gate, provenance, duplicate, and score check passed."
   },
@@ -260,7 +270,9 @@ Allowed values:
 
 For an early hard-gate rejection, score and review may be `null`, but include the evidence establishing rejection and a precise `rejection_reason`. For a hold, include every established field plus the unresolved fact. The tracker derives `PUBLISH`, `UNDER_THRESHOLD`, `HOLD`, or `REJECT`; the packet does not choose the decision.
 
-`content_hash` must be `null` or omitted; the tracker computes it from the normalized material packet and never trusts a caller-supplied value. When `lookup` reports possible fingerprint duplicates but no strong identity match, inspect them before writing. To create a genuinely distinct record, provide:
+`content_hash` must be `null` or omitted; the tracker computes it from the normalized material packet and never trusts a caller-supplied value. `review.reviewer_id` must identify the actual independent agent/task or separated self-review, and `review.subject_hash` must exactly equal the current `review-subject` result. The subject binds the normalized candidate and evidence to the current CV, confirmed profile, and configuration.
+
+For a new candidate, both `record_id` and `expected_prior_content_hash` are `null`. To explicitly update or merge into an existing candidate, take both `record_id` and current `content_hash` from `lookup` or `due`, set the latter as `expected_prior_content_hash`, then recompute the review subject. The tracker refuses stale hashes and incompatible institution, country, official-ID, URL/alias, or fingerprint identity. When `lookup` reports possible fingerprint duplicates but no strong identity match, inspect them before writing. To create a genuinely distinct record, provide:
 
 For a fixed deadline, put the vacancy/admission deadline in `program_deadline` and any separate funding deadline in `funding_deadline`. `effective_action_deadline` must repeat the earlier mandatory component; the tracker derives and checks it. For explicit open-until-filled positions, use `deadline_status=OPEN_UNTIL_FILLED`, `deadline_precision=ROLLING`, and null component/effective deadlines.
 
@@ -275,7 +287,7 @@ For a fixed deadline, put the vacancy/admission deadline in `program_deadline` a
 }
 ```
 
-To merge with an existing vacancy, supply its trusted `record_id` instead. Never use a fingerprint alone as decisive identity.
+To merge with an existing vacancy, supply its trusted `record_id` and current `content_hash` as described above. Never use a fingerprint alone as decisive identity.
 
 ## Coverage packet
 
@@ -302,6 +314,8 @@ To merge with an existing vacancy, supply its trusted `record_id` instead. Never
 ```
 
 Allowed country status: `COMPLETE`, `PARTIAL`, `FAILED`. Allowed source status: `OK`, `PARTIAL`, `FAILED`. The tracker downgrades a country marked complete when any included required source is partial/failed and inserts a failed entry for any configured country omitted from the packet.
+
+When `config.json` defines a required core source object with a `url`, the coverage entry must use that same normalized URL. Matching its display name with a different URL does not satisfy the requirement.
 
 ## CSV and report contracts
 

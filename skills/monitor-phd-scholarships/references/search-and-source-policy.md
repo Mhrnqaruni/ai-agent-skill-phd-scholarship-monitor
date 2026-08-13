@@ -57,7 +57,7 @@ At the beginning of each run:
 3. Load known aliases and due records from SQLite.
 4. Establish the source and query plan for each country.
 
-Before the baseline run, save at least one meaningful required core source for every configured country. In practice, use multiple complementary official/national sources where available. The tracker refuses `COMPLETE` coverage for an empty required-source registry or an empty source record.
+Before the baseline run, save at least one meaningful required core source for every configured country. Store every required source as an object containing both a stable display name and canonical URL; only that normalized URL satisfies coverage—the free-form name cannot substitute for it. In practice, use multiple complementary official/national sources where available. The tracker refuses `COMPLETE` coverage for an empty required-source registry or an empty source record.
 
 At the end of the run, provide a coverage entry for every configured country even if zero candidates were discovered.
 

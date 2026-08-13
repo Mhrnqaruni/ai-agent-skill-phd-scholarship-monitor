@@ -58,6 +58,8 @@ For each extracted fact, record a provenance value:
 
 Do not turn absence into a negative fact. For example, a CV that omits nationality does not establish any nationality.
 
+The tracker hashes the relative filename, size, and bytes of every supported CV file in `input/`. Do not edit or replace those files during a live run. After any CV change, re-extract the profile and obtain fresh confirmation; changing the CV alone causes the next run to stop rather than use stale fit or eligibility facts.
+
 ## Profile confirmation
 
 Create `profile.json` using this minimum shape. Additional structured fields are allowed.
@@ -118,7 +120,7 @@ Important fields:
 - `search.reverify_active_days`: normal active-record verification interval.
 - `search.reverify_closing_days`: near-deadline verification interval.
 - `search.max_run_hours`: stale-run lock recovery boundary.
-- `source_registry`: country-specific official, national, and discovery sources.
+- `source_registry`: country-specific official, national, and discovery sources. Every `required_core_sources` entry must be an object with a stable `name` and canonical `url`.
 
 The schedule prompt must never hardcode countries. It must read the current configuration each day.
 
@@ -135,7 +137,7 @@ The schedule prompt must never hardcode countries. It must read the current conf
 ### CV or profile changes
 
 - Re-extract only after reading the updated CV or receiving confirmed corrections.
-- Ask the user to confirm the new structured profile.
+- Ask the user to confirm the new structured profile and set `confirmed_at` to that real confirmation time.
 - Let `run-start` detect the new profile hash.
 - Reassess every active, rolling, closing-soon, and held record affected by the changed facts.
 - Preserve score-at-discovery and evaluation history.

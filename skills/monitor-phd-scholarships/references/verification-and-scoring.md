@@ -130,6 +130,8 @@ Store evidence quality separately as `verification_confidence` from 0 to 100. Pu
 
 Before publication, conduct a second review separated from discovery/scoring.
 
+First write the normalized candidate JSON with `review=null` and run the tracker's `review-subject` command. The verifier must review that exact packet, direct evidence set, and returned CV/profile/config-bound subject hash. Store a nonblank reviewer ID and copy the exact hash into `review.subject_hash`. A review from another candidate, an earlier evidence snapshot, or a different CV/profile/configuration is invalid. If any candidate, evidence, score, identity, or runtime-context field changes after review, recompute the hash and repeat the review.
+
 The critic must check:
 
 - direct official and application URLs work and refer to the same vacancy;
@@ -143,4 +145,4 @@ The critic must check:
 - main risk and short explanation;
 - absence of unsupported claims.
 
-Use `INDEPENDENT_AGENT` when a distinct verifier performs the review. Use `SELF_SECOND_PASS` only when no separate agent is available. Publication requires verdict `PASS`; `HOLD` or `FAIL` cannot be overridden by enthusiasm or score.
+Use `INDEPENDENT_AGENT` when a distinct verifier performs the review and identify that verifier in `reviewer_id`. Use `SELF_SECOND_PASS` only when no separate agent is available, using a clear self-review identifier. Publication requires verdict `PASS`; `HOLD` or `FAIL` cannot be overridden by enthusiasm or score.

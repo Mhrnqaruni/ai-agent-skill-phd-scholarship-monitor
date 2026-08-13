@@ -67,11 +67,11 @@ Do not embed the country list, CV facts, threshold, or funding routes in this pr
 4. Search all configured countries and required core sources.
 5. Deduplicate discoveries before full evaluation.
 6. Reverify due records and evaluate new/changed candidates.
-7. Critically review every potentially publishable candidate.
+7. Compute each potentially publishable packet's `review-subject` hash, critically review that exact candidate/evidence/profile snapshot, and bind the verdict to the returned hash.
 8. Finish the run with full coverage JSON.
 9. Return the generated report and paths to the CSV/report.
 
-Treat the configuration and confirmed profile as immutable from steps 2–8. If either changes, abort and restart the run; the tracker enforces this snapshot boundary.
+Treat the configuration, confirmed profile, and CV files as immutable from steps 2–8. If any changes, abort and restart the run; the tracker enforces this snapshot boundary.
 
 If an unrecoverable error occurs after step 2, call `run-abort`. Do not leave a live lock silently.
 

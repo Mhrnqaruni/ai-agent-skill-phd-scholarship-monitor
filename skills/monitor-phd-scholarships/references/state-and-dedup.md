@@ -21,12 +21,12 @@ The lead agent is the sole writer. Subagents return evidence packets; they never
 
 Resolve candidate identity in this order:
 
-1. Existing `record_id`, when explicitly supplied by a trusted tracker lookup.
+1. Existing `record_id`, when explicitly supplied with the current canonical `content_hash` returned by a trusted tracker `lookup` or `due` result.
 2. Official vacancy/requisition ID scoped to the institution or authoritative host.
 3. Normalized official or known alias URL.
 4. Exact deterministic fingerprint of official ID, institution, title/topic, department/supervisor, location, and deadline/start cycle as a possible-duplicate signal only.
 
-The tracker removes common tracking parameters and URL fragments, but it does not use fuzzy merging. A fingerprint never overwrites a record by itself. If it reports possible duplicates, resolve them explicitly: supply the existing `record_id` to merge, or document why the candidate is distinct.
+The tracker removes common tracking parameters and URL fragments, but it does not use fuzzy merging. A fingerprint never overwrites a record by itself. If it reports possible duplicates, resolve them explicitly: supply the existing `record_id` plus `expected_prior_content_hash` to merge, or document why the candidate is distinct. The tracker refuses an update that changes canonical institution/country identity, replaces an established official ID, or races a newer evaluation.
 
 Model these cases carefully:
 
@@ -95,7 +95,9 @@ Retain evaluation history so score/profile changes are auditable. Keep `score_at
 
 ## Profile and country changes
 
-At `run-start`, the tracker compares current configuration and profile hashes with the last completed run.
+At `run-start`, the tracker compares current configuration, profile, and deterministic CV-inventory hashes with the last completed run. Every live command also checks those hashes against the run snapshot.
+
+If the CV changed, the profile must also change and `profile.confirmed_at` must be later than the prior complete run. Otherwise `run-start` refuses unattended monitoring until the CV is re-extracted and the profile is explicitly reconfirmed.
 
 If the profile changed:
 

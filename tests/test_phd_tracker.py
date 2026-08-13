@@ -56,7 +56,10 @@ class TrackerTestCase(unittest.TestCase):
         config_path = self.workspace / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["source_registry"]["Netherlands"]["required_core_sources"] = [
-            "Netherlands official vacancies"
+            {
+                "name": "Netherlands official vacancies",
+                "url": "https://official.example/netherlands",
+            }
         ]
         self.write_json(config_path, config)
         self.cli("validate")
@@ -225,13 +228,37 @@ class TrackerTestCase(unittest.TestCase):
             "review": {
                 "mode": "INDEPENDENT_AGENT",
                 "verdict": "PASS",
+                "reviewer_id": "test-independent-reviewer",
+                "subject_hash": None,
                 "reviewed_at": self.now(),
                 "notes": "Independent verification passed.",
             },
             "rejection_reason": None,
         }
 
+    def prepare_packet(self, packet: dict, name: str = "subject-candidate.json") -> dict:
+        if packet.get("record_id") and not packet.get("expected_prior_content_hash"):
+            connection = sqlite3.connect(self.workspace / "tracker.sqlite3")
+            row = connection.execute(
+                "SELECT content_hash FROM opportunities WHERE record_id = ?",
+                (packet["record_id"],),
+            ).fetchone()
+            connection.close()
+            self.assertIsNotNone(row)
+            packet["expected_prior_content_hash"] = row[0]
+        review = packet.get("review")
+        packet["review"] = None
+        path = self.workspace / name
+        self.write_json(path, packet)
+        subject_hash = self.cli("review-subject", "--file", str(path))["subject_hash"]
+        packet["review"] = review
+        if isinstance(review, dict):
+            review["reviewer_id"] = review.get("reviewer_id") or "test-independent-reviewer"
+            review["subject_hash"] = subject_hash
+        return packet
+
     def upsert(self, run_id: str, packet: dict, name: str = "candidate.json") -> dict:
+        self.prepare_packet(packet, f"subject-{name}")
         path = self.workspace / name
         self.write_json(path, packet)
         return self.cli("candidate-upsert", "--run-id", run_id, "--file", str(path))
@@ -435,12 +462,38 @@ class TrackerTestCase(unittest.TestCase):
         profile["confirmed_at"] = self.now()
         self.write_json(profile_path, profile)
         path = self.workspace / "candidate.json"
-        self.write_json(path, self.candidate())
+        packet = self.prepare_packet(self.candidate())
+        self.write_json(path, packet)
         error = self.cli(
             "candidate-upsert", "--run-id", run_id, "--file", str(path), expect=2
         )
         self.assertIn("snapshot drift", error["error"])
         self.cli("run-abort", "--run-id", run_id, "--reason", "test complete")
+
+    def test_mid_run_cv_drift_blocks_writes(self) -> None:
+        run_id = self.start()
+        packet = self.prepare_packet(self.candidate())
+        (self.workspace / "input" / "cv.txt").write_text(
+            "A materially different CV was placed here during the run.",
+            encoding="utf-8",
+        )
+        path = self.workspace / "candidate.json"
+        self.write_json(path, packet)
+        error = self.cli(
+            "candidate-upsert", "--run-id", run_id, "--file", str(path), expect=2
+        )
+        self.assertIn("CV input changed", error["error"])
+        self.cli("run-abort", "--run-id", run_id, "--reason", "test complete")
+
+    def test_cv_change_between_runs_requires_profile_reconfirmation(self) -> None:
+        first_run = self.start()
+        self.finish(first_run)
+        (self.workspace / "input" / "cv.txt").write_text(
+            "The CV changed after the completed baseline.", encoding="utf-8"
+        )
+        error = self.cli("run-start", expect=2)
+        self.assertIn("profile.json was not updated and reconfirmed", error["error"])
+        self.assertFalse((self.workspace / ".run.lock").exists())
 
     def test_first_promotion_from_hold_is_reported_as_new(self) -> None:
         first_run = self.start()
@@ -470,6 +523,98 @@ class TrackerTestCase(unittest.TestCase):
         )
         self.assertIn("tracker-computed", error["error"])
         self.cli("run-abort", "--run-id", run_id, "--reason", "test complete")
+
+    def test_record_id_cannot_overwrite_unrelated_candidate(self) -> None:
+        run_id = self.start()
+        first = self.upsert(run_id, self.candidate(suffix="identity-a"), "first.json")
+        second = self.candidate(suffix="identity-b")
+        second["record_id"] = first["record_id"]
+        self.prepare_packet(second, "identity-subject.json")
+        path = self.workspace / "identity-overwrite.json"
+        self.write_json(path, second)
+        error = self.cli(
+            "candidate-upsert", "--run-id", run_id, "--file", str(path), expect=2
+        )
+        self.assertIn("cannot remove or replace the canonical official_id", error["error"])
+        connection = sqlite3.connect(self.workspace / "tracker.sqlite3")
+        stored = connection.execute(
+            "SELECT official_id, title FROM opportunities WHERE record_id = ?",
+            (first["record_id"],),
+        ).fetchone()
+        connection.close()
+        self.assertEqual("REQ-identity-a", stored[0])
+        self.assertIn("identity-a", stored[1])
+        self.cli("run-abort", "--run-id", run_id, "--reason", "test complete")
+
+    def test_critical_review_cannot_be_replayed_across_candidates(self) -> None:
+        run_id = self.start()
+        first = self.prepare_packet(self.candidate(suffix="review-a"), "review-a.json")
+        second = self.prepare_packet(self.candidate(suffix="review-b"), "review-b.json")
+        second["review"] = json.loads(json.dumps(first["review"]))
+        path = self.workspace / "review-replay.json"
+        self.write_json(path, second)
+        error = self.cli(
+            "candidate-upsert", "--run-id", run_id, "--file", str(path), expect=2
+        )
+        self.assertIn("not bound to this normalized candidate", error["error"])
+        self.cli("run-abort", "--run-id", run_id, "--reason", "test complete")
+
+    def test_critical_review_is_bound_to_confirmed_profile(self) -> None:
+        packet = self.prepare_packet(self.candidate(suffix="profile-bound"))
+        profile_path = self.workspace / "profile.json"
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        profile["research_interests"].append("a newly confirmed research interest")
+        profile["confirmed_at"] = self.now()
+        self.write_json(profile_path, profile)
+        run_id = self.start()
+        path = self.workspace / "stale-profile-review.json"
+        self.write_json(path, packet)
+        error = self.cli(
+            "candidate-upsert", "--run-id", run_id, "--file", str(path), expect=2
+        )
+        self.assertIn("not bound to this normalized candidate", error["error"])
+        self.cli("run-abort", "--run-id", run_id, "--reason", "test complete")
+
+    def test_required_source_url_cannot_be_spoofed_by_name(self) -> None:
+        config_path = self.workspace / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["source_registry"]["Netherlands"]["required_core_sources"] = [
+            {
+                "name": "Trusted Official Registry",
+                "url": "https://trusted.example/jobs",
+            }
+        ]
+        self.write_json(config_path, config)
+        run_id = self.start()
+        coverage = {
+            "countries": {
+                "Netherlands": {
+                    "status": "COMPLETE",
+                    "notes": "Attempted name-only substitution.",
+                    "sources": [
+                        {
+                            "name": "Trusted Official Registry",
+                            "url": "https://evil.example/not-trusted",
+                            "class": "OFFICIAL",
+                            "status": "OK",
+                            "checked_at": self.now(),
+                            "candidates_seen": 0,
+                            "note": "",
+                        }
+                    ],
+                }
+            }
+        }
+        path = self.workspace / "spoofed-coverage.json"
+        self.write_json(path, coverage)
+        outcome = self.cli(
+            "run-finish", "--run-id", run_id, "--coverage", str(path)
+        )
+        self.assertEqual("PARTIAL", outcome["status"])
+        self.assertIn(
+            "Missing successful required core sources",
+            outcome["coverage"]["countries"]["Netherlands"]["notes"],
+        )
 
     def test_complete_coverage_requires_configured_sources(self) -> None:
         config_path = self.workspace / "config.json"
@@ -552,6 +697,7 @@ class TrackerTestCase(unittest.TestCase):
             "effective_action_deadline",
         ):
             second[key] = first[key]
+        self.prepare_packet(second)
         path = self.workspace / "second.json"
         self.write_json(path, second)
         error = self.cli(
@@ -597,7 +743,7 @@ class TrackerTestCase(unittest.TestCase):
         )
         self.assertEqual("COMPLETE", outcome["status"])
 
-    def test_schema_one_workspace_migrates_to_schema_two(self) -> None:
+    def test_schema_one_workspace_migrates_to_current_schema(self) -> None:
         connection = sqlite3.connect(self.workspace / "tracker.sqlite3")
         connection.execute("ALTER TABLE opportunities DROP COLUMN stipend_amount")
         connection.execute("ALTER TABLE opportunities DROP COLUMN stipend_currency")
@@ -612,10 +758,27 @@ class TrackerTestCase(unittest.TestCase):
             row[1] for row in connection.execute("PRAGMA table_info(opportunities)").fetchall()
         }
         connection.close()
-        self.assertEqual(2, version)
+        self.assertEqual(3, version)
         self.assertTrue(
             {"stipend_amount", "stipend_currency", "stipend_period"}.issubset(columns)
         )
+
+    def test_schema_two_workspace_adds_cv_snapshot_columns(self) -> None:
+        connection = sqlite3.connect(self.workspace / "tracker.sqlite3")
+        connection.execute("ALTER TABLE runs DROP COLUMN cv_hash")
+        connection.execute("ALTER TABLE runs DROP COLUMN cv_changed")
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+        connection.close()
+        self.cli("validate")
+        connection = sqlite3.connect(self.workspace / "tracker.sqlite3")
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        connection.close()
+        self.assertEqual(3, version)
+        self.assertTrue({"cv_hash", "cv_changed"}.issubset(columns))
 
     def test_finished_run_lock_is_recovered_on_next_start(self) -> None:
         first_run = self.start()

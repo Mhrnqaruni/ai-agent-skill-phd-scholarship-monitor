@@ -97,6 +97,10 @@ The bundled standard-library Python tracker provides:
 - official-ID, normalized-URL, alias, and deterministic-fingerprint deduplication;
 - due-date logic for active, rolling, held, and near-deadline records;
 - CV/profile and country-change detection;
+- byte-level CV/config/profile snapshots enforced throughout each run;
+- critic-review hashes bound to the exact candidate, evidence, CV, profile, and configuration;
+- optimistic content-hash and stable-identity checks for explicit record updates;
+- exact normalized-URL matching for URL-configured required sources;
 - single-run locking and stale-run recovery;
 - automatic SQLite backups;
 - hard-gate and score-contract validation;
