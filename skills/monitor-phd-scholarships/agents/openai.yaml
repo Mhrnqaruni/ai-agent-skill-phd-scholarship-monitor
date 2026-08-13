@@ -1,0 +1,4 @@
+interface:
+  display_name: "PhD Scholarship Monitor"
+  short_description: "Find verified, funded PhD matches daily"
+  default_prompt: "Use $monitor-phd-scholarships to find and track verified funded PhD opportunities matched to my confirmed CV profile."
