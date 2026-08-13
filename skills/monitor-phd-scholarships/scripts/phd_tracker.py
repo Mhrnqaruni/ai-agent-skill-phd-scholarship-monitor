@@ -295,11 +295,15 @@ def parse_timestamp(value: Any, field: str) -> datetime:
 
 
 def load_timezone(name: str):
+    if normalized_text(name) in {"utc", "etc/utc", "etc/gmt", "gmt", "z"}:
+        return timezone.utc
     require(ZoneInfo is not None, "Python zoneinfo support is required")
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ContractError(f"Unknown IANA timezone: {name}") from exc
+        raise ContractError(
+            f"Unknown IANA timezone: {name}. On Windows Python, install the tzdata package for named zones"
+        ) from exc
 
 
 def deadline_expired(value: str | None, timezone_name: str, now: datetime | None = None) -> bool:

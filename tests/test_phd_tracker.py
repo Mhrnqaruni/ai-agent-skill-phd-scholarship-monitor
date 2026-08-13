@@ -338,6 +338,43 @@ class TrackerTestCase(unittest.TestCase):
         self.assertTrue(any("not accepted" in reason for reason in result["reasons"]))
         self.cli("run-abort", "--run-id", run_id, "--reason", "test complete")
 
+    def test_named_iana_timezone_initializes(self) -> None:
+        named_workspace = Path(self.temporary.name) / "named-zone-monitor"
+        command = [
+            sys.executable,
+            str(SCRIPT),
+            "--workspace",
+            str(named_workspace),
+            "init",
+            "--country",
+            "Singapore",
+            "--timezone",
+            "Asia/Singapore",
+            "--daily-time",
+            "12:00",
+        ]
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_utc_initializes_without_site_timezone_package(self) -> None:
+        utc_workspace = Path(self.temporary.name) / "stdlib-utc-monitor"
+        command = [
+            sys.executable,
+            "-S",
+            str(SCRIPT),
+            "--workspace",
+            str(utc_workspace),
+            "init",
+            "--country",
+            "Netherlands",
+            "--timezone",
+            "UTC",
+            "--daily-time",
+            "12:00",
+        ]
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def test_configured_stipend_floor_is_enforced(self) -> None:
         config_path = self.workspace / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))

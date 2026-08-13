@@ -20,6 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install IANA timezone data for cross-platform tests
+        run: python -m pip install --disable-pip-version-check tzdata
       - name: Compile
         run: python -m compileall -q skills tests
       - name: Test
